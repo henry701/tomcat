@@ -36,6 +36,7 @@ public class LowLatencyTaskQueue extends LinkedBlockingQueue<Runnable> {
 
     @Serial
     private static final long serialVersionUID = 1L;
+
     protected static final StringManager sm = StringManager.getManager(LowLatencyTaskQueue.class);
 
     private transient volatile LowLatencyThreadPoolExecutor parent = null;
@@ -70,31 +71,6 @@ public class LowLatencyTaskQueue extends LinkedBlockingQueue<Runnable> {
         }
         return super.offer(o); //forces the item onto the queue, to be used if the task is rejected
     }
-
-
-    @Override
-    public boolean offer(Runnable o) {
-        LowLatencyThreadPoolExecutor gotParent = parent;
-        //we can't do any checks
-        if (gotParent == null) {
-            return super.offer(o);
-        }
-        //we are maxed out on threads, simply queue the object
-        if (gotParent.getPoolSizeNoLock() == gotParent.getMaximumPoolSize()) {
-            return super.offer(o);
-        }
-        //we have idle threads, just add it to the queue
-        if (gotParent.getSubmittedCount() <= gotParent.getPoolSizeNoLock()) {
-            return super.offer(o);
-        }
-        //if we have less threads than maximum force creation of a new thread
-        if (gotParent.getPoolSizeNoLock() < gotParent.getMaximumPoolSize()) {
-            return false;
-        }
-        //if we reached here, we need to add it to the queue
-        return super.offer(o);
-    }
-
 
     @Override
     public Runnable poll(long timeout, TimeUnit unit)

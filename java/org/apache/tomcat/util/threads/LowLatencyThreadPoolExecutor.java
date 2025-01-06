@@ -32,10 +32,14 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -443,6 +447,28 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      */
     private void decrementWorkerCount() {
         ctl.addAndGet(-1);
+    }
+
+    /**
+     * The executor used for adding other worker threads.
+     * Used for low latency to avoid paying the cost of thread start-up
+     * in the caller that enqueues new tasks, but still delegates to the caller
+     * if the queue is full, to not delay thread creation too much.
+     */
+    private final ExecutorService workerAdderExecutor = createWorkerAdderExecutor();
+
+    private static ThreadPoolExecutor createWorkerAdderExecutor() {
+        ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
+            1, 1, 8L, TimeUnit.HOURS,
+            new LinkedBlockingQueue<>(3), r -> {
+            Thread thread = new Thread(r);
+            thread.setName("LowLatencyThreadPoolExecutor-WorkerAdderThread");
+            thread.setDaemon(true);
+            thread.setPriority(Thread.NORM_PRIORITY + 1);
+            return thread;
+        }, new ThreadPoolExecutor.CallerRunsPolicy());
+        threadPoolExecutor.prestartAllCoreThreads();
+        return threadPoolExecutor;
     }
 
     /**
@@ -1081,11 +1107,10 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * Main worker run loop. Repeatedly gets tasks from queue and
      * executes them, while coping with a number of issues:
      *
-     * 1. We may start out with an initial task, in which case we
-     * don't need to get the first one. Otherwise, as long as pool is
-     * running, we get tasks from getTask. If it returns null then the
-     * worker exits due to changed pool state or configuration
-     * parameters. Other exits result from exception throws in
+     * 1. As long as pool is running, we get tasks from getTask.
+     * If it returns null then the worker exits due to
+     * changed pool state or configuration parameters.
+     * Other exits result from exception throws in
      * external code, in which case completedAbruptly holds, which
      * usually leads processWorkerExit to replace this thread.
      *
@@ -1398,32 +1423,36 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
          * we are shut down or saturated and so reject the task.
          */
         boolean queued = tryQueueTaskInternal(command);
+        workerAdderExecutor.execute(this::createMissingThreads);
+        if(queued) {
+            return;
+        }
+        if(!tryQueueTaskInternal(command)) {
+            reject(command);
+        }
+    }
+
+    private void createMissingThreads() {
         int c = ctl.get();
         int lastWorkerCount = workerCountOf(c);
         int coreThreadsMissing = corePoolSize - lastWorkerCount;
         int threadsBeforeMaxHit = maximumPoolSize - lastWorkerCount;
         int coreThreadsToCreate = Math.min(coreThreadsMissing, threadsBeforeMaxHit);
         if (coreThreadsToCreate > 0) {
-            for (int i = 0; i < coreThreadsToCreate; i++) {
-                if(!addWorker(true)) {
-                    break;
-                }
-            }
+            addWorkers(coreThreadsToCreate, true);
         }
         int idleThreadsMissing = idlePoolTarget - getIdleCountNoLock();
         int idleThreadsToCreate = Math.min(idleThreadsMissing, threadsBeforeMaxHit);
         if (idleThreadsToCreate > 0) {
-            for (int i = 0; i < idleThreadsToCreate; i++) {
-                if(!addWorker(false)) {
-                    break;
-                }
+            addWorkers(idleThreadsToCreate, false);
+        }
+    }
+
+    private void addWorkers(int workersToCreate, boolean core) {
+        for (int i = 0; i < workersToCreate; i++) {
+            if (!addWorker(core)) {
+                break;
             }
-        }
-        if(queued) {
-            return;
-        }
-        if(!tryQueueTaskInternal(command)) {
-            reject(command);
         }
     }
 
@@ -1661,12 +1690,8 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         this.idlePoolTarget = idlePoolTarget;
         if (delta > 0) {
             // Start enough new workers to reach the target
-            int missing = idlePoolTarget - getIdleCountNoLock();
-            for (int i = 0; i < missing; i++) {
-                if(!addWorker(false)) {
-                    break;
-                }
-            }
+            int missingIdleThreads = idlePoolTarget - getIdleCountNoLock();
+            addWorkers(missingIdleThreads, false);
         }
     }
 
@@ -1714,8 +1739,12 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * @return the number of threads started
      */
     public int prestartAllCoreThreads() {
+        return addWorkersUntilFull(true);
+    }
+
+    private int addWorkersUntilFull(boolean core) {
         int n = 0;
-        while (addWorker(true)) {
+        while (addWorker(core)) {
             ++n;
         }
         return n;
@@ -1963,18 +1992,6 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         } finally {
             mainLock.unlock();
         }
-    }
-
-    /**
-     * Returns the current number of threads in the pool.
-     * <br><b>NOTE</b>: this method only used in {@link TaskQueue#offer(Runnable)},
-     * where operations are frequent, can greatly reduce unnecessary
-     * performance overhead by a lock-free way.
-     * @return the number of threads
-     */
-    protected int getPoolSizeNoLock() {
-        return runStateAtLeast(ctl.get(), TIDYING) ? 0
-            : workers.size();
     }
 
     /**
@@ -2256,12 +2273,14 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
 
 
     /**
-     * Method invoked when the Executor has terminated. Default
-     * implementation does nothing. Note: To properly nest multiple
-     * overridings, subclasses should generally invoke
+     * Method invoked when the Executor has terminated.
+     * Note: To properly nest multiple overridings,
+     * subclasses should generally invoke
      * {@code super.terminated} within this method.
      */
-    protected void terminated() { }
+    protected void terminated() {
+        this.workerAdderExecutor.shutdownNow();
+    }
 
     /* Predefined RejectedExecutionHandlers */
 
