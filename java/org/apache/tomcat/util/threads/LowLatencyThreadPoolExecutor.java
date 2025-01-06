@@ -32,14 +32,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -49,7 +48,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
- * An {@link java.util.concurrent.ExecutorService}
+ * An {@link ExecutorService}
  * that executes each submitted task using
  * one of possibly several pooled threads, normally configured
  * using {@link Executors} factory methods.
@@ -83,7 +82,7 @@ import org.apache.tomcat.util.res.StringManager;
  * according to the bounds set by
  * corePoolSize (see {@link #getCorePoolSize}) and
  * maximumPoolSize (see {@link #getMaximumPoolSize}).
- *
+ * <p>
  * When a new task is submitted in method {@link #execute(Runnable)},
  * if fewer than corePoolSize threads are running, a new thread is
  * created, even if other worker threads are
@@ -161,7 +160,7 @@ import org.apache.tomcat.util.res.StringManager;
  * rejected.
  *
  * </ul>
- *
+ * <p>
  * There are three general strategies for queuing:
  * <ol>
  *
@@ -178,7 +177,7 @@ import org.apache.tomcat.util.res.StringManager;
  * arrive on average faster than they can be processed.
  *
  * <li><em> Unbounded queues.</em> Using an unbounded queue (for
- * example a {@link java.util.concurrent.LinkedBlockingQueue}
+ * example a {@link LinkedBlockingQueue}
  * without a predefined
  * capacity) will cause new tasks to wait in the queue when all
  * corePoolSize threads are busy. Thus, no more than corePoolSize
@@ -222,29 +221,29 @@ import org.apache.tomcat.util.res.StringManager;
  *
  * <ol>
  *
- * <li>In the default {@link LowLatencyThreadPoolExecutor.AbortPolicy}, the handler
+ * <li>In the default {@link AbortPolicy}, the handler
  * throws a runtime {@link RejectedExecutionException} upon rejection.
  *
- * <li>In {@link LowLatencyThreadPoolExecutor.CallerRunsPolicy}, the thread
+ * <li>In {@link CallerRunsPolicy}, the thread
  * that invokes {@code execute} itself runs the task. This provides a
  * simple feedback control mechanism that will slow down the rate that
  * new tasks are submitted.
  *
- * <li>In {@link LowLatencyThreadPoolExecutor.DiscardPolicy}, a task that cannot
+ * <li>In {@link DiscardPolicy}, a task that cannot
  * be executed is simply dropped. This policy is designed only for
  * those rare cases in which task completion is never relied upon.
  *
- * <li>In {@link LowLatencyThreadPoolExecutor.DiscardOldestPolicy}, if the
+ * <li>In {@link DiscardOldestPolicy}, if the
  * executor is not shut down, the task at the head of the work queue
  * is dropped, and then execution is retried (which can fail again,
  * causing this to be repeated.) This policy is rarely acceptable. In
  * nearly all cases, you should also cancel the task to cause an
  * exception in any component waiting for its completion, and/or log
  * the failure, as illustrated in {@link
- * LowLatencyThreadPoolExecutor.DiscardOldestPolicy} documentation.
+ * DiscardOldestPolicy} documentation.
  *
  * </ol>
- *
+ * <p>
  * It is possible to define and use other kinds of {@link
  * RejectedExecutionHandler} classes. Doing so requires some care
  * especially when policies are designed to work only under particular
@@ -330,26 +329,26 @@ import org.apache.tomcat.util.res.StringManager;
  *   }
  * }}</pre>
  *
- * @since 1.5
  * @author Doug Lea
+ * @since 1.5
  */
-public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
+public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implements ResizableExecutor {
 
     protected static final StringManager sm = StringManager.getManager(LowLatencyThreadPoolExecutor.class);
 
     /**
      * The main pool control state, ctl, is an atomic integer packing
      * two conceptual fields
-     *   workerCount, indicating the effective number of threads
-     *   runState,    indicating whether running, shutting down etc
-     *
+     * workerCount, indicating the effective number of threads
+     * runState,    indicating whether running, shutting down etc
+     * <p>
      * In order to pack them into one int, we limit workerCount to
      * (2^29)-1 (about 500 million) threads rather than (2^31)-1 (2
      * billion) otherwise representable. If this is ever an issue in
      * the future, the variable can be changed to be an AtomicLong,
      * and the shift/mask constants below adjusted. But until the need
      * arises, this code is a bit faster and simpler using an int.
-     *
+     * <p>
      * The workerCount is the number of workers that have been
      * permitted to start and not permitted to stop. The value may be
      * transiently different from the actual number of live threads,
@@ -357,36 +356,36 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * asked, and when exiting threads are still performing
      * bookkeeping before terminating. The user-visible pool size is
      * reported as the current size of the workers set.
-     *
+     * <p>
      * The runState provides the main lifecycle control, taking on values:
-     *
-     *   RUNNING:  Accept new tasks and process queued tasks
-     *   SHUTDOWN: Don't accept new tasks, but process queued tasks
-     *   STOP:     Don't accept new tasks, don't process queued tasks,
-     *             and interrupt in-progress tasks
-     *   TIDYING:  All tasks have terminated, workerCount is zero,
-     *             the thread transitioning to state TIDYING
-     *             will run the terminated() hook method
-     *   TERMINATED: terminated() has completed
-     *
+     * <p>
+     * RUNNING:  Accept new tasks and process queued tasks
+     * SHUTDOWN: Don't accept new tasks, but process queued tasks
+     * STOP:     Don't accept new tasks, don't process queued tasks,
+     * and interrupt in-progress tasks
+     * TIDYING:  All tasks have terminated, workerCount is zero,
+     * the thread transitioning to state TIDYING
+     * will run the terminated() hook method
+     * TERMINATED: terminated() has completed
+     * <p>
      * The numerical order among these values matters, to allow
      * ordered comparisons. The runState monotonically increases over
      * time, but need not hit each state. The transitions are:
-     *
+     * <p>
      * RUNNING -> SHUTDOWN
-     *    On invocation of shutdown()
+     * On invocation of shutdown()
      * (RUNNING or SHUTDOWN) -> STOP
-     *    On invocation of shutdownNow()
+     * On invocation of shutdownNow()
      * SHUTDOWN -> TIDYING
-     *    When both queue and pool are empty
+     * When both queue and pool are empty
      * STOP -> TIDYING
-     *    When pool is empty
+     * When pool is empty
      * TIDYING -> TERMINATED
-     *    When the terminated() hook method has completed
-     *
+     * When the terminated() hook method has completed
+     * <p>
      * Threads waiting in awaitTermination() will return when the
      * state reaches TERMINATED.
-     *
+     * <p>
      * Detecting the transition from SHUTDOWN to TIDYING is less
      * straightforward than you'd like because the queue may become
      * empty after non-empty and vice versa during SHUTDOWN state, but
@@ -450,25 +449,58 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
     }
 
     /**
-     * The executor used for adding other worker threads.
+     * The worker used for adding other worker threads.
      * Used for low latency to avoid paying the cost of thread start-up
      * in the caller that enqueues new tasks, but still delegates to the caller
      * if the queue is full, to not delay thread creation too much.
      */
-    private final ExecutorService workerAdderExecutor = createWorkerAdderExecutor();
+    private final WorkerAdder workerAdder;
 
-    private static ThreadPoolExecutor createWorkerAdderExecutor() {
-        ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
-            1, 1, 8L, TimeUnit.HOURS,
-            new LinkedBlockingQueue<>(3), r -> {
-            Thread thread = new Thread(r);
-            thread.setName("LowLatencyThreadPoolExecutor-WorkerAdderThread");
-            thread.setDaemon(true);
-            thread.setPriority(Thread.NORM_PRIORITY + 1);
-            return thread;
-        }, new ThreadPoolExecutor.CallerRunsPolicy());
-        threadPoolExecutor.prestartAllCoreThreads();
-        return threadPoolExecutor;
+    private class WorkerAdder extends Thread {
+
+        private final Semaphore semaphore = new Semaphore(0);
+
+        public WorkerAdder() {
+            super();
+            this.setName("LowLatencyThreadPoolExecutor-WorkerAdderThread");
+            this.setDaemon(true);
+        }
+
+        @Override
+        public void run() {
+            LowLatencyThreadPoolExecutor parent = LowLatencyThreadPoolExecutor.this;
+            for (int c = parent.ctl.get(); isRunning(c); c = parent.ctl.get()) {
+                parent.workerAdder.createMissingThreads(c);
+                try {
+                    // There's a slight race condition here, but it's ok:
+                    // It's better than executing the loop too often.
+                    semaphore.drainPermits();
+                    semaphore.acquire();
+                } catch (InterruptedException e) {
+                    this.interrupt();
+                }
+            }
+        }
+
+        private void createMissingThreads(int c) {
+            LowLatencyThreadPoolExecutor parent = LowLatencyThreadPoolExecutor.this;
+            int lastWorkerCount = workerCountOf(c);
+            int coreThreadsMissing = parent.corePoolSize - lastWorkerCount;
+            int threadsBeforeMaxHit = parent.maximumPoolSize - lastWorkerCount;
+            int coreThreadsToCreate = Math.min(coreThreadsMissing, threadsBeforeMaxHit);
+            if (coreThreadsToCreate > 0) {
+                parent.addWorkers(coreThreadsToCreate, true);
+            }
+            int idleThreadsMissing = parent.idlePoolTarget - parent.getIdleCountNoLockWithRetry();
+            int idleThreadsToCreate = Math.min(idleThreadsMissing, threadsBeforeMaxHit);
+            if (idleThreadsToCreate > 0) {
+                parent.addWorkers(idleThreadsToCreate, false);
+            }
+        }
+
+        public void awaken() {
+            semaphore.release();
+        }
     }
 
     /**
@@ -500,8 +532,8 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
     private final ReentrantLock mainLock = new ReentrantLock();
 
     /**
-     * Set containing all worker threads in pool. Accessed only when
-     * holding mainLock.
+     * Set containing all worker threads in pool.
+     * Should be accessed only when holding mainLock.
      */
     private final HashSet<Worker> workers = new HashSet<>();
 
@@ -558,7 +590,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * treated as an error, failure to create threads may result in
      * new tasks being rejected or existing ones remaining stuck in
      * the queue.
-     *
+     * <p>
      * We go further and preserve pool invariants even in the face of
      * errors such as OutOfMemoryError, that might be thrown while
      * trying to create threads. Such errors are rather common due to
@@ -593,7 +625,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * Core pool size is the minimum number of workers to keep alive
      * (and not allow to time out etc) unless allowCoreThreadTimeOut
      * is set, in which case the minimum is zero.
-     *
+     * <p>
      * Since the worker count is actually stored in COUNT_BITS bits,
      * the effective limit is {@code corePoolSize & COUNT_MASK}.
      */
@@ -601,7 +633,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
 
     /**
      * Maximum pool size.
-     *
+     * <p>
      * Since the worker count is actually stored in COUNT_BITS bits,
      * the effective limit is {@code maximumPoolSize & COUNT_MASK}.
      */
@@ -636,9 +668,8 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * runWorker).
      */
     private final class Worker
-        extends AbstractQueuedSynchronizer
-        implements Runnable
-    {
+            extends AbstractQueuedSynchronizer
+            implements Runnable {
         /**
          * This class will never be serialized, but we provide a
          * serialVersionUID to suppress a javac warning.
@@ -646,9 +677,13 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         @Serial
         private static final long serialVersionUID = 6139094804551838834L;
 
-        /** Thread this worker is running in. Null if factory fails. */
+        /**
+         * Thread this worker is running in. Null if factory fails.
+         */
         final Thread thread;
-        /** Per-thread task counter */
+        /**
+         * Per-thread task counter
+         */
         volatile long completedTasks;
 
         // TODO: switch to AbstractQueuedLongSynchronizer and move
@@ -662,7 +697,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
             this.thread = getThreadFactory().newThread(this);
         }
 
-        /** Delegates main run loop to outer runWorker. */
+        /**
+         * Delegates main run loop to outer runWorker.
+         */
         @Override
         public void run() {
             runWorker(this);
@@ -694,10 +731,21 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
             return true;
         }
 
-        public void lock()        { acquire(1); }
-        public boolean tryLock()  { return tryAcquire(1); }
-        public void unlock()      { release(1); }
-        public boolean isLocked() { return isHeldExclusively(); }
+        public void lock() {
+            acquire(1);
+        }
+
+        public boolean tryLock() {
+            return tryAcquire(1);
+        }
+
+        public void unlock() {
+            release(1);
+        }
+
+        public boolean isLocked() {
+            return isHeldExclusively();
+        }
 
         void interruptIfStarted() {
             Thread t;
@@ -719,7 +767,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * already at least the given target.
      *
      * @param targetState the desired state, either SHUTDOWN or STOP
-     *        (but not TIDYING or TERMINATED -- use tryTerminate for that)
+     *                    (but not TIDYING or TERMINATED -- use tryTerminate for that)
      */
     private void advanceRunState(int targetState) {
         // assert targetState == SHUTDOWN || targetState == STOP;
@@ -899,9 +947,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * Thread.start()), we roll back cleanly.
      *
      * @param core if true use corePoolSize as bound, else
-     * maximumPoolSize. (A boolean indicator is used here rather than a
-     * value to ensure reads of fresh values after checking other pool
-     * state).
+     *             maximumPoolSize. (A boolean indicator is used here rather than a
+     *             value to ensure reads of fresh values after checking other pool
+     *             state).
      * @return true if successful
      */
     private boolean addWorker(boolean core) {
@@ -923,10 +971,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                     break retry;
                 }
                 c = ctl.get();  // Re-read ctl
-                if (runStateAtLeast(c, SHUTDOWN))
-                 {
+                if (runStateAtLeast(c, SHUTDOWN)) {
                     continue retry;
-                // else CAS failed due to workerCount change; retry inner loop
+                    // else CAS failed due to workerCount change; retry inner loop
                 }
             }
         }
@@ -1106,24 +1153,24 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
     /**
      * Main worker run loop. Repeatedly gets tasks from queue and
      * executes them, while coping with a number of issues:
-     *
+     * <p>
      * 1. As long as pool is running, we get tasks from getTask.
      * If it returns null then the worker exits due to
      * changed pool state or configuration parameters.
      * Other exits result from exception throws in
      * external code, in which case completedAbruptly holds, which
      * usually leads processWorkerExit to replace this thread.
-     *
+     * <p>
      * 2. Before running any task, the lock is acquired to prevent
      * other pool interrupts while the task is executing, and then we
      * ensure that unless pool is stopping, this thread does not have
      * its interrupt set.
-     *
+     * <p>
      * 3. Each task run is preceded by a call to beforeExecute, which
      * might throw an exception, in which case we cause thread to die
      * (breaking loop with completedAbruptly true) without processing
      * the task.
-     *
+     * <p>
      * 4. Assuming beforeExecute completes normally, we run the task,
      * gathering any of its thrown exceptions to send to afterExecute.
      * We separately handle RuntimeException, Error (both of which the
@@ -1132,12 +1179,12 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * wrap them within Errors on the way out (to the thread's
      * UncaughtExceptionHandler). Any thrown exception also
      * conservatively causes thread to die.
-     *
+     * <p>
      * 5. After task.run completes, we call afterExecute, which may
      * also throw an exception, which will also cause thread to
      * die. According to JLS Sec 14.20, this exception is the one that
      * will be in effect even if task.run throws.
-     *
+     * <p>
      * The net effect of the exception mechanics is that afterExecute
      * and the thread's UncaughtExceptionHandler have as accurate
      * information as we can provide about any problems encountered by
@@ -1190,29 +1237,29 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * Creates a new {@code ThreadPoolExecutor} with the given initial
      * parameters, the
      * {@linkplain Executors#defaultThreadFactory default thread factory}
-     * and the {@linkplain LowLatencyThreadPoolExecutor.RejectPolicy
+     * and the {@linkplain RejectPolicy
      * default rejected execution handler}.
      *
      * <p>It may be more convenient to use one of the {@link Executors}
      * factory methods instead of this general purpose constructor.
      *
-     * @param corePoolSize the number of threads to keep in the pool, even
-     *        if they are idle, unless {@code allowCoreThreadTimeOut} is set
+     * @param corePoolSize    the number of threads to keep in the pool, even
+     *                        if they are idle, unless {@code allowCoreThreadTimeOut} is set
      * @param maximumPoolSize the maximum number of threads to allow in the
-     *        pool
-     * @param keepAliveTime when the number of threads is greater than
-     *        the core, this is the maximum time that excess idle threads
-     *        will wait for new tasks before terminating.
-     * @param unit the time unit for the {@code keepAliveTime} argument
-     * @param workQueue the queue to use for holding tasks before they are
-     *        executed. This queue will hold only the {@code Runnable}
-     *        tasks submitted by the {@code execute} method.
+     *                        pool
+     * @param keepAliveTime   when the number of threads is greater than
+     *                        the core, this is the maximum time that excess idle threads
+     *                        will wait for new tasks before terminating.
+     * @param unit            the time unit for the {@code keepAliveTime} argument
+     * @param workQueue       the queue to use for holding tasks before they are
+     *                        executed. This queue will hold only the {@code Runnable}
+     *                        tasks submitted by the {@code execute} method.
      * @throws IllegalArgumentException if one of the following holds:<br>
-     *         {@code corePoolSize < 0}<br>
-     *         {@code keepAliveTime < 0}<br>
-     *         {@code maximumPoolSize <= 0}<br>
-     *         {@code maximumPoolSize < corePoolSize}
-     * @throws NullPointerException if {@code workQueue} is null
+     *                                  {@code corePoolSize < 0}<br>
+     *                                  {@code keepAliveTime < 0}<br>
+     *                                  {@code maximumPoolSize <= 0}<br>
+     *                                  {@code maximumPoolSize < corePoolSize}
+     * @throws NullPointerException     if {@code workQueue} is null
      */
     public LowLatencyThreadPoolExecutor(int corePoolSize,
                                         int maximumPoolSize,
@@ -1220,34 +1267,34 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                                         TimeUnit unit,
                                         BlockingQueue<Runnable> workQueue) {
         this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue,
-             Executors.defaultThreadFactory(), defaultHandler);
+                Executors.defaultThreadFactory(), defaultHandler);
     }
 
     /**
      * Creates a new {@code ThreadPoolExecutor} with the given initial
-     * parameters and the {@linkplain LowLatencyThreadPoolExecutor.RejectPolicy
+     * parameters and the {@linkplain RejectPolicy
      * default rejected execution handler}.
      *
-     * @param corePoolSize the number of threads to keep in the pool, even
-     *        if they are idle, unless {@code allowCoreThreadTimeOut} is set
+     * @param corePoolSize    the number of threads to keep in the pool, even
+     *                        if they are idle, unless {@code allowCoreThreadTimeOut} is set
      * @param maximumPoolSize the maximum number of threads to allow in the
-     *        pool
-     * @param keepAliveTime when the number of threads is greater than
-     *        the core, this is the maximum time that excess idle threads
-     *        will wait for new tasks before terminating.
-     * @param unit the time unit for the {@code keepAliveTime} argument
-     * @param workQueue the queue to use for holding tasks before they are
-     *        executed. This queue will hold only the {@code Runnable}
-     *        tasks submitted by the {@code execute} method.
-     * @param threadFactory the factory to use when the executor
-     *        creates a new thread
+     *                        pool
+     * @param keepAliveTime   when the number of threads is greater than
+     *                        the core, this is the maximum time that excess idle threads
+     *                        will wait for new tasks before terminating.
+     * @param unit            the time unit for the {@code keepAliveTime} argument
+     * @param workQueue       the queue to use for holding tasks before they are
+     *                        executed. This queue will hold only the {@code Runnable}
+     *                        tasks submitted by the {@code execute} method.
+     * @param threadFactory   the factory to use when the executor
+     *                        creates a new thread
      * @throws IllegalArgumentException if one of the following holds:<br>
-     *         {@code corePoolSize < 0}<br>
-     *         {@code keepAliveTime < 0}<br>
-     *         {@code maximumPoolSize <= 0}<br>
-     *         {@code maximumPoolSize < corePoolSize}
-     * @throws NullPointerException if {@code workQueue}
-     *         or {@code threadFactory} is null
+     *                                  {@code corePoolSize < 0}<br>
+     *                                  {@code keepAliveTime < 0}<br>
+     *                                  {@code maximumPoolSize <= 0}<br>
+     *                                  {@code maximumPoolSize < corePoolSize}
+     * @throws NullPointerException     if {@code workQueue}
+     *                                  or {@code threadFactory} is null
      */
     public LowLatencyThreadPoolExecutor(int corePoolSize,
                                         int maximumPoolSize,
@@ -1256,7 +1303,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                                         BlockingQueue<Runnable> workQueue,
                                         ThreadFactory threadFactory) {
         this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue,
-             threadFactory, defaultHandler);
+                threadFactory, defaultHandler);
     }
 
     /**
@@ -1264,26 +1311,26 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * parameters and the
      * {@linkplain Executors#defaultThreadFactory default thread factory}.
      *
-     * @param corePoolSize the number of threads to keep in the pool, even
-     *        if they are idle, unless {@code allowCoreThreadTimeOut} is set
+     * @param corePoolSize    the number of threads to keep in the pool, even
+     *                        if they are idle, unless {@code allowCoreThreadTimeOut} is set
      * @param maximumPoolSize the maximum number of threads to allow in the
-     *        pool
-     * @param keepAliveTime when the number of threads is greater than
-     *        the core, this is the maximum time that excess idle threads
-     *        will wait for new tasks before terminating.
-     * @param unit the time unit for the {@code keepAliveTime} argument
-     * @param workQueue the queue to use for holding tasks before they are
-     *        executed. This queue will hold only the {@code Runnable}
-     *        tasks submitted by the {@code execute} method.
-     * @param handler the handler to use when execution is blocked
-     *        because the thread bounds and queue capacities are reached
+     *                        pool
+     * @param keepAliveTime   when the number of threads is greater than
+     *                        the core, this is the maximum time that excess idle threads
+     *                        will wait for new tasks before terminating.
+     * @param unit            the time unit for the {@code keepAliveTime} argument
+     * @param workQueue       the queue to use for holding tasks before they are
+     *                        executed. This queue will hold only the {@code Runnable}
+     *                        tasks submitted by the {@code execute} method.
+     * @param handler         the handler to use when execution is blocked
+     *                        because the thread bounds and queue capacities are reached
      * @throws IllegalArgumentException if one of the following holds:<br>
-     *         {@code corePoolSize < 0}<br>
-     *         {@code keepAliveTime < 0}<br>
-     *         {@code maximumPoolSize <= 0}<br>
-     *         {@code maximumPoolSize < corePoolSize}
-     * @throws NullPointerException if {@code workQueue}
-     *         or {@code handler} is null
+     *                                  {@code corePoolSize < 0}<br>
+     *                                  {@code keepAliveTime < 0}<br>
+     *                                  {@code maximumPoolSize <= 0}<br>
+     *                                  {@code maximumPoolSize < corePoolSize}
+     * @throws NullPointerException     if {@code workQueue}
+     *                                  or {@code handler} is null
      */
     public LowLatencyThreadPoolExecutor(int corePoolSize,
                                         int maximumPoolSize,
@@ -1292,35 +1339,35 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                                         BlockingQueue<Runnable> workQueue,
                                         RejectedExecutionHandler handler) {
         this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue,
-             Executors.defaultThreadFactory(), handler);
+                Executors.defaultThreadFactory(), handler);
     }
 
     /**
      * Creates a new {@code ThreadPoolExecutor} with the given initial
      * parameters.
      *
-     * @param corePoolSize the number of threads to keep in the pool, even
-     *        if they are idle, unless {@code allowCoreThreadTimeOut} is set
+     * @param corePoolSize    the number of threads to keep in the pool, even
+     *                        if they are idle, unless {@code allowCoreThreadTimeOut} is set
      * @param maximumPoolSize the maximum number of threads to allow in the
-     *        pool
-     * @param keepAliveTime when the number of threads is greater than
-     *        the core, this is the maximum time that excess idle threads
-     *        will wait for new tasks before terminating.
-     * @param unit the time unit for the {@code keepAliveTime} argument
-     * @param workQueue the queue to use for holding tasks before they are
-     *        executed. This queue will hold only the {@code Runnable}
-     *        tasks submitted by the {@code execute} method.
-     * @param threadFactory the factory to use when the executor
-     *        creates a new thread
-     * @param handler the handler to use when execution is blocked
-     *        because the thread bounds and queue capacities are reached
+     *                        pool
+     * @param keepAliveTime   when the number of threads is greater than
+     *                        the core, this is the maximum time that excess idle threads
+     *                        will wait for new tasks before terminating.
+     * @param unit            the time unit for the {@code keepAliveTime} argument
+     * @param workQueue       the queue to use for holding tasks before they are
+     *                        executed. This queue will hold only the {@code Runnable}
+     *                        tasks submitted by the {@code execute} method.
+     * @param threadFactory   the factory to use when the executor
+     *                        creates a new thread
+     * @param handler         the handler to use when execution is blocked
+     *                        because the thread bounds and queue capacities are reached
      * @throws IllegalArgumentException if one of the following holds:<br>
-     *         {@code corePoolSize < 0}<br>
-     *         {@code keepAliveTime < 0}<br>
-     *         {@code maximumPoolSize <= 0}<br>
-     *         {@code maximumPoolSize < corePoolSize}
-     * @throws NullPointerException if {@code workQueue}
-     *         or {@code threadFactory} or {@code handler} is null
+     *                                  {@code corePoolSize < 0}<br>
+     *                                  {@code keepAliveTime < 0}<br>
+     *                                  {@code maximumPoolSize <= 0}<br>
+     *                                  {@code maximumPoolSize < corePoolSize}
+     * @throws NullPointerException     if {@code workQueue}
+     *                                  or {@code threadFactory} or {@code handler} is null
      */
     public LowLatencyThreadPoolExecutor(int corePoolSize,
                                         int maximumPoolSize,
@@ -1330,9 +1377,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                                         ThreadFactory threadFactory,
                                         RejectedExecutionHandler handler) {
         if (corePoolSize < 0 ||
-            maximumPoolSize <= 0 ||
-            maximumPoolSize < corePoolSize ||
-            keepAliveTime < 0) {
+                maximumPoolSize <= 0 ||
+                maximumPoolSize < corePoolSize ||
+                keepAliveTime < 0) {
             throw new IllegalArgumentException();
         }
         if (workQueue == null || threadFactory == null || handler == null) {
@@ -1344,8 +1391,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         this.keepAliveTime = unit.toNanos(keepAliveTime);
         this.threadFactory = threadFactory;
         this.handler = handler;
-
+        this.workerAdder = new WorkerAdder();
         prestartAllCoreThreads();
+        this.workerAdder.start();
     }
 
 
@@ -1365,8 +1413,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
                     submittedCount.decrementAndGet();
                     throw new RejectedExecutionException(sm.getString("threadPoolExecutor.queueFull"));
                 }
-            }
-            else if (gotQueue instanceof LowLatencyTaskQueue queue) {
+            } else if (gotQueue instanceof LowLatencyTaskQueue queue) {
                 if (!queue.force(command)) {
                     submittedCount.decrementAndGet();
                     throw new RejectedExecutionException(sm.getString("threadPoolExecutor.queueFull"));
@@ -1423,28 +1470,12 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
          * we are shut down or saturated and so reject the task.
          */
         boolean queued = tryQueueTaskInternal(command);
-        workerAdderExecutor.execute(this::createMissingThreads);
-        if(queued) {
+        this.workerAdder.awaken();
+        if (queued) {
             return;
         }
-        if(!tryQueueTaskInternal(command)) {
+        if (!tryQueueTaskInternal(command)) {
             reject(command);
-        }
-    }
-
-    private void createMissingThreads() {
-        int c = ctl.get();
-        int lastWorkerCount = workerCountOf(c);
-        int coreThreadsMissing = corePoolSize - lastWorkerCount;
-        int threadsBeforeMaxHit = maximumPoolSize - lastWorkerCount;
-        int coreThreadsToCreate = Math.min(coreThreadsMissing, threadsBeforeMaxHit);
-        if (coreThreadsToCreate > 0) {
-            addWorkers(coreThreadsToCreate, true);
-        }
-        int idleThreadsMissing = idlePoolTarget - getIdleCountNoLock();
-        int idleThreadsToCreate = Math.min(idleThreadsMissing, threadsBeforeMaxHit);
-        if (idleThreadsToCreate > 0) {
-            addWorkers(idleThreadsToCreate, false);
         }
     }
 
@@ -1690,7 +1721,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         this.idlePoolTarget = idlePoolTarget;
         if (delta > 0) {
             // Start enough new workers to reach the target
-            int missingIdleThreads = idlePoolTarget - getIdleCountNoLock();
+            int missingIdleThreads = idlePoolTarget - getIdleCountNoLockWithRetry();
             addWorkers(missingIdleThreads, false);
         }
     }
@@ -1739,7 +1770,9 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * @return the number of threads started
      */
     public int prestartAllCoreThreads() {
-        return addWorkersUntilFull(true);
+        int addedCoreThreads = addWorkersUntilFull(true);
+        this.workerAdder.awaken();
+        return addedCoreThreads;
     }
 
     private int addWorkersUntilFull(boolean core) {
@@ -1938,7 +1971,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
             Iterator<Runnable> it = q.iterator();
             while (it.hasNext()) {
                 Runnable r = it.next();
-                if (r instanceof Future<?> && ((Future<?>)r).isCancelled()) {
+                if (r instanceof Future<?> && ((Future<?>) r).isCancelled()) {
                     it.remove();
                 }
             }
@@ -1947,7 +1980,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
             // Make copy for traversal and call remove for cancelled entries.
             // The slow path is more likely to be O(N*N).
             for (Object r : q.toArray()) {
-                if (r instanceof Future<?> && ((Future<?>)r).isCancelled()) {
+                if (r instanceof Future<?> && ((Future<?>) r).isCancelled()) {
                     q.remove(r);
                 }
             }
@@ -1994,6 +2027,11 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         }
     }
 
+    @Override
+    public int getMaxThreads() {
+        return getMaximumPoolSize();
+    }
+
     /**
      * Returns the approximate number of threads that are actively
      * executing tasks.
@@ -2016,6 +2054,18 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
         }
     }
 
+    @Override
+    public boolean resizePool(int corePoolSize, int maximumPoolSize) {
+        setCorePoolSize(corePoolSize);
+        setMaximumPoolSize(maximumPoolSize);
+        return true;
+    }
+
+    @Override
+    public boolean resizeQueue(int capacity) {
+        return false;
+    }
+
     /**
      * Returns the approximate number of threads that are waiting
      * for tasks.
@@ -2029,6 +2079,16 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
             return getIdleCountNoLock();
         } finally {
             mainLock.unlock();
+        }
+    }
+
+    private int getIdleCountNoLockWithRetry() {
+        while (true) {
+            try {
+                return getIdleCountNoLock();
+            } catch (ConcurrentModificationException e) {
+                // ignore and retry
+            }
         }
     }
 
@@ -2219,7 +2279,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      *
      * @param r the runnable that has completed
      * @param t the exception that caused termination, or null if
-     * execution completed normally
+     *          execution completed normally
      */
     protected void afterExecute(Runnable r, Throwable t) {
         // Throwing StopPooledThreadException is likely to cause this method to
@@ -2279,7 +2339,8 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService {
      * {@code super.terminated} within this method.
      */
     protected void terminated() {
-        this.workerAdderExecutor.shutdownNow();
+        this.workerAdder.interrupt();
+        this.workerAdder.awaken();
     }
 
     /* Predefined RejectedExecutionHandlers */
