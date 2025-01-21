@@ -458,7 +458,13 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
 
     private class WorkerAdder extends Thread {
 
+        private static final int MIN_MILLIS_BETWEEN_PARKS = 5;
+        private static final int IDLE_POOL_PERMIT_SEMAPHORE_DIVISOR = 8;
+        private static final int DIVISOR_DIVISOR_WHEN_NO_CREATED_THREADS = 2;
+
         private final Semaphore semaphore = new Semaphore(0);
+
+        private long lastRan = 0;
 
         public WorkerAdder() {
             super();
@@ -469,37 +475,86 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
         @Override
         public void run() {
             LowLatencyThreadPoolExecutor parent = LowLatencyThreadPoolExecutor.this;
-            for (int c = parent.ctl.get(); isRunning(c); c = parent.ctl.get()) {
-                parent.workerAdder.createMissingThreads(c);
-                try {
-                    // There's a slight race condition here, but it's ok:
-                    // It's better than executing the loop too often.
-                    semaphore.drainPermits();
-                    semaphore.acquire();
-                } catch (InterruptedException e) {
-                    this.interrupt();
+            while (true) {
+                int c = parent.ctl.get();
+                if (!isRunning(c)) {
+                    break;
+                }
+                int createdThreads = this.createMissingThreads(c);
+                long lastRanLocal = lastRan;
+                long currentClock = System.currentTimeMillis();
+                this.lastRan = currentClock;
+                // Don't go to sleep too often, but also don't hog the CPU.
+                // These guards helps not overload the poller thread with too many tasks.
+                final boolean createdNoThreads = createdThreads == 0;
+                if (createdNoThreads || currentClock - lastRanLocal > MIN_MILLIS_BETWEEN_PARKS) {
+                    try {
+                        // There's a slight race condition here, but it's ok,
+                        // it's better than executing the loop too often.
+                        semaphore.drainPermits();
+                        // Reduce number of context switches by waiting for multiple permits.
+                        final int permitDivisor = IDLE_POOL_PERMIT_SEMAPHORE_DIVISOR / (createdNoThreads ? DIVISOR_DIVISOR_WHEN_NO_CREATED_THREADS : 1);
+                        final int rawPermitsToAcquire = parent.idlePoolTarget / permitDivisor;
+                        final int permitsToAcquire = Math.max(1, rawPermitsToAcquire);
+                        semaphore.acquire(permitsToAcquire);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                 }
             }
         }
 
-        private void createMissingThreads(int c) {
+        private int createMissingThreads(int c) {
             LowLatencyThreadPoolExecutor parent = LowLatencyThreadPoolExecutor.this;
             int lastWorkerCount = workerCountOf(c);
             int coreThreadsMissing = parent.corePoolSize - lastWorkerCount;
             int threadsBeforeMaxHit = parent.maximumPoolSize - lastWorkerCount;
             int coreThreadsToCreate = Math.min(coreThreadsMissing, threadsBeforeMaxHit);
+            int totalCreatedThreads = 0;
             if (coreThreadsToCreate > 0) {
-                parent.addWorkers(coreThreadsToCreate, true);
+                threadsBeforeMaxHit = threadsBeforeMaxHit + coreThreadsToCreate;
+                totalCreatedThreads += parent.addWorkers(coreThreadsToCreate, true);
             }
-            int idleThreadsMissing = parent.idlePoolTarget - parent.getIdleCountNoLockWithRetry();
-            int idleThreadsToCreate = Math.min(idleThreadsMissing, threadsBeforeMaxHit);
-            if (idleThreadsToCreate > 0) {
-                parent.addWorkers(idleThreadsToCreate, false);
+            totalCreatedThreads += createMissingIdleThreads(threadsBeforeMaxHit);
+            return totalCreatedThreads;
+        }
+
+        private int createMissingIdleThreads(int threadsBeforeMaxHit) {
+            LowLatencyThreadPoolExecutor parent = LowLatencyThreadPoolExecutor.this;
+            int maxIdleThreadsToCreate = Math.min(parent.idlePoolTarget, threadsBeforeMaxHit);
+            if (maxIdleThreadsToCreate <= 0) {
+                return 0;
             }
+            int currentIdleThreads = 0;
+            try {
+                for (Worker w : parent.workers) {
+                    if (!w.isLocked()) {
+                        ++currentIdleThreads;
+                        // We already met the target, no need to add any idle threads
+                        if (currentIdleThreads >= maxIdleThreadsToCreate) {
+                            return 0;
+                        }
+                    }
+                }
+            } catch (ConcurrentModificationException e) {
+                // Someone else already added or removed workers, so we can't trust the count.
+                // Assume that we're getting saturated fast and add more workers to compensate.
+                currentIdleThreads = 0;
+            }
+            int idleThreadsMissing = parent.idlePoolTarget - currentIdleThreads;
+            int idleThreadsToCreate = Math.min(idleThreadsMissing, maxIdleThreadsToCreate);
+            if (idleThreadsToCreate <= 0) {
+                return 0;
+            }
+            return parent.addWorkers(idleThreadsToCreate, false);
+        }
+
+        public void awakeTick() {
+            semaphore.release();
         }
 
         public void awaken() {
-            semaphore.release();
+            semaphore.release(100000);
         }
     }
 
@@ -1194,11 +1249,11 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
      */
     final void runWorker(Worker w) {
         Thread wt = Thread.currentThread();
-        Runnable task = null;
         w.unlock(); // allow interrupts
         boolean completedAbruptly = true;
         try {
-            while (task != null || (task = getTask()) != null) {
+            Runnable task;
+            while ((task = getTask()) != null) {
                 w.lock();
                 // If pool is stopping, ensure thread is interrupted;
                 // if not, ensure thread is not interrupted. This
@@ -1220,7 +1275,6 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
                         throw ex;
                     }
                 } finally {
-                    task = null;
                     w.completedTasks++;
                     w.unlock();
                 }
@@ -1470,7 +1524,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
          * we are shut down or saturated and so reject the task.
          */
         boolean queued = tryQueueTaskInternal(command);
-        this.workerAdder.awaken();
+        this.workerAdder.awakeTick();
         if (queued) {
             return;
         }
@@ -1479,12 +1533,13 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
         }
     }
 
-    private void addWorkers(int workersToCreate, boolean core) {
+    private int addWorkers(int workersToCreate, boolean core) {
         for (int i = 0; i < workersToCreate; i++) {
             if (!addWorker(core)) {
-                break;
+                return i;
             }
         }
+        return workersToCreate;
     }
 
     private boolean tryQueueTaskInternal(Runnable command) {
@@ -1721,7 +1776,7 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
         this.idlePoolTarget = idlePoolTarget;
         if (delta > 0) {
             // Start enough new workers to reach the target
-            int missingIdleThreads = idlePoolTarget - getIdleCountNoLockWithRetry();
+            int missingIdleThreads = idlePoolTarget - getIdleCount();
             addWorkers(missingIdleThreads, false);
         }
     }
@@ -2076,30 +2131,16 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
         final ReentrantLock mainLock = this.mainLock;
         mainLock.lock();
         try {
-            return getIdleCountNoLock();
+            int n = 0;
+            for (Worker w : workers) {
+                if (!w.isLocked()) {
+                    ++n;
+                }
+            }
+            return n;
         } finally {
             mainLock.unlock();
         }
-    }
-
-    private int getIdleCountNoLockWithRetry() {
-        while (true) {
-            try {
-                return getIdleCountNoLock();
-            } catch (ConcurrentModificationException e) {
-                // ignore and retry
-            }
-        }
-    }
-
-    private int getIdleCountNoLock() {
-        int n = 0;
-        for (Worker w : workers) {
-            if (!w.isLocked()) {
-                ++n;
-            }
-        }
-        return n;
     }
 
     /**
@@ -2340,7 +2381,6 @@ public class LowLatencyThreadPoolExecutor extends AbstractExecutorService implem
      */
     protected void terminated() {
         this.workerAdder.interrupt();
-        this.workerAdder.awaken();
     }
 
     /* Predefined RejectedExecutionHandlers */
